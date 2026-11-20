@@ -1,0 +1,22 @@
+[project]
+name = "hsu-reserve"
+version = "0.1.0"
+description = "MCP server: 한성대학교 상상베이스/코딩라운지 공간 예약 조회·예약·검증·취소"
+readme = "README.md"
+authors = [
+    { name = "SangwanYu", email = "ryusangwan12@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "httpx>=0.28.1",
+    "keyring>=25.7.0",
+    "mcp>=2.3.0",
+]
+
+[project.scripts]
+hsu-reserve-mcp = "hsu_reserve.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
