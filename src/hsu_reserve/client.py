@@ -481,22 +481,27 @@ class HsuClient:
                 for box in td.find_all("div", class_="conBox"):
                     text = box.get_text(" ", strip=True)
                     matches = list(_TIME_RANGE.finditer(text))
-                    if len(matches) != 1:
-                        raise ValueError("unreadable occupied range")
+                    if not matches or not re.fullmatch(
+                        rf"{_TIME_RANGE.pattern}(?:\s*,\s*{_TIME_RANGE.pattern})*",
+                        text[matches[0].start():],
+                    ):
+                        raise ValueError("unreadable occupied ranges")
                     m = matches[0]
                     name = text[: m.start()].strip().lstrip("-").strip()
                     room_name = names.get(re.sub(r"\s+", "", name))
                     if room_name is None:
                         raise ValueError("unknown occupied room")
-                    t = datetime(2000, 1, 1, int(m[1]), int(m[2]))
-                    end = datetime(2000, 1, 1, int(m[3]), int(m[4]))
-                    if t >= end:
-                        raise ValueError("invalid occupied range")
                     slots = busy.setdefault((room_name, day), set())
-                    # Minute precision also blocks partial overlaps with a booking slot.
-                    while t < end:
-                        slots.add(t.strftime("%H:%M"))
-                        t += timedelta(minutes=1)
+                    # One application can contain several comma-separated, disjoint ranges.
+                    for m in matches:
+                        t = datetime(2000, 1, 1, int(m[1]), int(m[2]))
+                        end = datetime(2000, 1, 1, int(m[3]), int(m[4]))
+                        if t >= end:
+                            raise ValueError("invalid occupied range")
+                        # Minute precision also blocks partial overlaps with a booking slot.
+                        while t < end:
+                            slots.add(t.strftime("%H:%M"))
+                            t += timedelta(minutes=1)
                     parsed_boxes += 1
             if days != set(range(1, monthrange(year, month)[1] + 1)):
                 raise ValueError("incomplete calendar")

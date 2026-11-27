@@ -41,9 +41,7 @@ irm https://raw.githubusercontent.com/wantkdd/hsu-reserve/master/install.ps1 | i
 
 ## 삭제
 
-```sh
-hsu-reserve-mcp uninstall && uv tool uninstall hsu-reserve
-```
+ZIP을 압축 해제한 폴더에서 Mac은 `uninstall-mac.command`, Windows는 `uninstall-windows.bat`를 실행하세요.
 
 ## 주의
 
