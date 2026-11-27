@@ -17,7 +17,7 @@ else
 fi
 
 echo "[2/3] 프로그램 설치 중..."
-uv tool install --force --quiet "$REPO"
+uv tool install --refresh --force --quiet "$REPO"
 
 echo "[3/3] 설정"
 # stdin is the curl pipe; read answers from the terminal instead.

@@ -18,7 +18,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "[2/3] Installing program ..."
-uv tool install --force --quiet $repo
+uv tool install --refresh --force --quiet $repo
 if ($LASTEXITCODE -ne 0) { throw "uv tool install failed" }
 
 Write-Host "[3/3] Setup"
