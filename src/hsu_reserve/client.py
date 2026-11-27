@@ -1,20 +1,27 @@
 """HTTP client for the Hansung University K2Web space reservation module (`/resve/...`).
 
 Flow mirrors the site's own JS (artclRegistView.js / common.js):
+  calendar     POST /resve/{site}/{fnct}/artclList.do   (public; one month, every room) → availability
+  room setup   POST /resve/{site}/{fnct}/artclSetupList.do, resveSetup.do, itemList.do (public; disk-cached)
   login        POST /hnuLogin/{site}/loginProcess.do
-  room setup   POST /resve/{site}/{fnct}/artclSetupList.do, resveSetup.do, itemList.do
-  taken hours  POST /resve/{site}/{fnct}/resveList.do  (resveSpceSeq, resveDeStr)
+  taken hours  POST /resve/{site}/{fnct}/resveList.do  (resveSpceSeq, resveDeStr) — authoritative pre-submit check
   submit       POST /resve/{site}/{fnct}/artclRegist.do (AJAX validation, then real form POST)
-  my list      POST /resve/{site}/{fnct}/artclView.do   (page=N, newest first)
+  my list      POST /resve/{site}/{fnct}/artclView.do   (page=N)
   cancel       GET  /resve/{site}/{fnct}/{id}/artclCancle.do
+
+The site sits behind a WAF that rejects bursts, so every request is spaced (MIN_REQUEST_INTERVAL),
+availability comes from one calendar page per place/month, and static room setup is cached on disk.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -27,6 +34,26 @@ BASE_URL = "https://www.hansung.ac.kr"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) hsu-reserve"
 KST = ZoneInfo("Asia/Seoul")
 WEEKDAYS_KO = "월화수목금토일"
+MIN_REQUEST_INTERVAL = 0.35  # seconds between requests to the school site
+CALENDAR_TTL = 60.0  # seconds an in-memory month calendar stays fresh
+SETUP_TTL = 12 * 3600.0  # seconds static room setup stays cached on disk
+_TIME_RANGE = re.compile(r"(\d{1,2}):(\d{2})\s*~\s*(\d{1,2}):(\d{2})")
+
+
+def _check_rejected(resp: httpx.Response) -> None:
+    if "<title>Request Rejected</title>" in resp.text[:300]:
+        sid = re.search(r"support ID is: <?(\d+)", resp.text)
+        raise HsuError(
+            "학교 사이트 보안장비가 요청을 거절했습니다(짧은 시간에 요청이 많았음). 잠시 후 다시 시도하세요."
+            + (f" 지원 ID: {sid[1]}" if sid else "")
+        )
+
+
+def _cache_dir() -> Path:
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "hsu-reserve"
+    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "hsu-reserve"
+
 
 IDENTITY_NAMES = {
     "IDENTITY_00001": "교수",
@@ -67,7 +94,7 @@ PLACES: dict[str, Place] = {
         site_id="onestop",
         fnct_no=16,
         max_hours_per_day=3,
-        note="상상관 B2. 그룹스터디룸 IB101~IB108(최소 3인, 합실 5인), 세미나실 IB111(최소 6인, 관리자 승인).",
+        note="상상관 B2. 그룹스터디룸 IB101-IB108(최소 3인, 합실 5인), 세미나실 IB111(최소 6인, 관리자 승인).",
     ),
     "coding_lounge": Place(
         key="coding_lounge",
@@ -75,7 +102,7 @@ PLACES: dict[str, Place] = {
         site_id="cncschool",
         fnct_no=7,
         max_hours_per_day=6,
-        note="공학관 A동 1층. 세미나실 101~105호(최대 12명), 106~113호(최대 8명). 예약 후 안내데스크 방문·신분증 지참.",
+        note="공학관 A동 1층. 세미나실 101-105호(최대 12명), 106-113호(최대 8명). 예약 후 안내데스크 방문·신분증 지참.",
     ),
 }
 
@@ -125,6 +152,16 @@ class RoomSetup:
     period_end: date
     items: tuple[FormItem, ...]
     raw_item_count: int  # site counts placeholder rows too (addItemCnt)
+
+
+@dataclass(frozen=True)
+class RoomRules:
+    hours: tuple[str, ...]  # slot start times, e.g. ("09:00", ..., "20:00")
+    slot_minutes: int
+    allowed_weekdays: tuple[str, ...]  # ("월", "화", ...)
+    lead_hours: int  # must book at least this many hours before slot start
+    period_start: date
+    period_end: date
 
     def slot_end(self, start: str) -> str:
         t = datetime.strptime(start, "%H:%M") + timedelta(minutes=self.slot_minutes)
@@ -207,7 +244,7 @@ def hours_between(start: str, end: str, slot_minutes: int = 60) -> list[str]:
         out.append(s.strftime("%H:%M"))
         s += timedelta(minutes=slot_minutes)
     if s != e:
-        raise HsuError(f"{start}~{end} 는 {slot_minutes}분 단위로 나누어떨어지지 않습니다.")
+        raise HsuError(f"{start}-{end} 는 {slot_minutes}분 단위로 나누어떨어지지 않습니다.")
     return out
 
 
@@ -228,13 +265,23 @@ class HsuClient:
         self._pw = password
         self._profiles: dict[str, Profile] = {}
         self._setup_cache: dict[tuple[str, int], RoomSetup] = {}
-        self._rooms_cache: dict[str, list[Room]] = {}
+        self._calendars: dict[tuple[str, int, int], tuple[float, list[Room], dict[tuple[str, date], set[str]]]] = {}
+        self._last_request = 0.0
+        self._disk_cache_path = _cache_dir() / "setup-v1.json"
+        self._disk_cache: dict[str, dict] | None = None
         self.http = httpx.Client(
             base_url=BASE_URL,
             headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
             timeout=timeout,
+            event_hooks={"request": [self._throttle]},
         )
+
+    def _throttle(self, request: httpx.Request) -> None:
+        wait = self._last_request + MIN_REQUEST_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request = time.monotonic()
 
     def close(self) -> None:
         self.http.close()
@@ -274,55 +321,125 @@ class HsuClient:
     def _read_profile(self, place: Place) -> Profile | None:
         resp = self.http.get(self._url(place, "artclRegistView"))
         resp.raise_for_status()
+        _check_rejected(resp)
         soup = BeautifulSoup(resp.text, "html.parser")
-        hakbun = soup.find("input", attrs={"name": "hakbun"})
-        if hakbun is None:
+        if soup.find("input", attrs={"name": "hakbun"}) is None:
             return None
 
         def val(name: str) -> str:
             el = soup.find("input", attrs={"name": name})
             return (el.get("value") or "") if el is not None else ""
 
-        rooms = []
-        group = soup.find("select", attrs={"name": "group"})
-        if group is not None:
-            for opt in group.find_all("option"):
-                if opt.get("value"):
-                    rooms.extend(self._group_rooms(place, int(opt["value"])))
-        self._rooms_cache[place.site_id] = rooms
         return Profile(name=val("userNm"), student_id=val("hakbun"), phone=val("telno"), email=val("email"))
-
-    def _group_rooms(self, place: Place, group_seq: int) -> list[Room]:
-        resp = self.http.post(
-            f"/resve/{place.site_id}/{place.fnct_no}/{group_seq}/getChildrenClList.do",
-            headers={"X-Requested-With": "XMLHttpRequest"},
-        )
-        resp.raise_for_status()
-        return [Room(seq=int(r["resveSpceSeq"]), name=str(r["specNm"]).strip()) for r in resp.json()]
 
     def profile(self, place: Place) -> Profile:
         return self._profiles.get(place.site_id) or self._login(place)
 
     def _post_json(self, place: Place, endpoint: str, data: dict) -> list[dict]:
+        """Logged-in JSON call; re-logs in once if the session expired."""
         self.profile(place)
         url = self._url(place, endpoint)
         headers = {"X-Requested-With": "XMLHttpRequest"}
         resp = self.http.post(url, data=data, headers=headers)
         resp.raise_for_status()
+        _check_rejected(resp)
         if not resp.headers.get("content-type", "").startswith("text/json"):
             self._login(place)  # session expired → HTML 알림 page instead of JSON
             resp = self.http.post(url, data=data, headers=headers)
             resp.raise_for_status()
+            _check_rejected(resp)
         try:
             return resp.json()
         except ValueError:
             raise HsuError(f"{endpoint} 응답을 해석하지 못했습니다: {resp.text[:200]!r}") from None
 
+    def _static_json(self, place: Place, endpoint: str, room: Room) -> list[dict]:
+        """Public, rarely-changing room setup; cached on disk for SETUP_TTL."""
+        if self._disk_cache is None:
+            try:
+                self._disk_cache = json.loads(self._disk_cache_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self._disk_cache = {}
+        key = f"{place.site_id}/{endpoint}/{room.seq}"
+        hit = self._disk_cache.get(key)
+        if hit and time.time() - hit["at"] < SETUP_TTL:
+            return hit["data"]
+        resp = self.http.post(
+            self._url(place, endpoint),
+            data={"resveSpceSeq": str(room.seq)},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        resp.raise_for_status()
+        _check_rejected(resp)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise HsuError(f"{endpoint} 응답을 해석하지 못했습니다: {resp.text[:200]!r}") from None
+        self._disk_cache[key] = {"at": time.time(), "data": data}
+        try:
+            self._disk_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._disk_cache_path.write_text(json.dumps(self._disk_cache, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass  # cache is an optimization only
+        return data
+
+    # ---------------- public month calendar ----------------
+
+    def _calendar(self, place: Place, year: int, month: int) -> tuple[list[Room], dict[tuple[str, date], set[str]]]:
+        """Every room's occupied/blocked slot starts for one month, from a single public page."""
+        key = (place.site_id, year, month)
+        hit = self._calendars.get(key)
+        if hit and time.monotonic() - hit[0] < CALENDAR_TTL:
+            return hit[1], hit[2]
+        resp = self.http.post(
+            self._url(place, "artclList"),
+            data={
+                "siteId": place.site_id,
+                "layout": "",
+                "year": str(year),
+                "month": str(month),
+                "kind": "",
+                "resveSpceSeq": "",
+            },
+        )
+        resp.raise_for_status()
+        _check_rejected(resp)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = soup.find(string=re.compile(r"\d{4}년\s*\d{1,2}월"))
+        ym = re.search(r"(\d{4})년\s*(\d{1,2})월", title or "")
+        if ym is None or (int(ym[1]), int(ym[2])) != (year, month):
+            raise HsuError(f"{year}-{month:02d} 예약 현황 달력을 읽지 못했습니다.")
+        rooms = [
+            Room(seq=int(o["value"]), name=o.get_text(strip=True))
+            for o in soup.select("#resveSpceSeq option")
+            if o.get("value")
+        ]
+        busy: dict[tuple[str, date], set[str]] = {}
+        for td in soup.find_all("td"):
+            span = td.find("span", recursive=False)
+            if span is None or not span.get_text(strip=True).isdigit():
+                continue
+            day = date(year, month, int(span.get_text(strip=True)))
+            for box in td.find_all("div", class_="conBox"):
+                text = box.get_text(" ", strip=True)
+                m = _TIME_RANGE.search(text)
+                if m is None:
+                    continue
+                room_name = text[: m.start()].strip().lstrip("-").strip()
+                t = datetime(2000, 1, 1, int(m[1]), int(m[2]))
+                end = datetime(2000, 1, 1, int(m[3]), int(m[4]))
+                slots = busy.setdefault((room_name, day), set())
+                while t < end:
+                    slots.add(t.strftime("%H:%M"))
+                    t += timedelta(minutes=30)  # finer than any slot; matched against slot starts below
+        self._calendars[key] = (time.monotonic(), rooms, busy)
+        return rooms, busy
+
     # ---------------- rooms & rules ----------------
 
     def rooms(self, place: Place) -> list[Room]:
-        self.profile(place)
-        return list(self._rooms_cache.get(place.site_id, []))
+        today = datetime.now(KST).date()
+        return list(self._calendar(place, today.year, today.month)[0])
 
     def find_room(self, place: Place, room: str) -> Room:
         rooms = self.rooms(place)
@@ -338,14 +455,24 @@ class HsuClient:
             raise HsuError(f"{room!r} 이(가) 여러 공간과 일치합니다: {', '.join(r.name for r in partial)}")
         raise HsuError(f"{place.name}에 {room!r} 공간이 없습니다. 가능한 공간: {names}")
 
+    def room_rules(self, place: Place, room: Room) -> RoomRules:
+        s = self._static_json(place, "resveSetup", room)[0]
+        return RoomRules(
+            hours=tuple(h.strip() for h in s["resveTm"].split(",") if h.strip()),
+            slot_minutes=int(s.get("posblTerm") or 60),
+            allowed_weekdays=tuple(d.strip() for d in (s.get("posblDay") or "").split(",") if d.strip()),
+            lead_hours=int(s.get("posblTm") or 0),
+            period_start=datetime.strptime(s["posblBgnde"], "%Y%m%d").date(),
+            period_end=datetime.strptime(s["posblEndde"], "%Y%m%d").date(),
+        )
+
     def room_setup(self, place: Place, room: Room) -> RoomSetup:
         key = (place.site_id, room.seq)
         if key in self._setup_cache:
             return self._setup_cache[key]
-        data = {"resveSpceSeq": str(room.seq)}
-        info = self._post_json(place, "artclSetupList", data)[0]
-        setup = self._post_json(place, "resveSetup", data)[0]
-        raw_items = self._post_json(place, "itemList", data)
+        info = self._static_json(place, "artclSetupList", room)[0]
+        raw_items = self._static_json(place, "itemList", room)
+        rules = self.room_rules(place, room)
         items = []
         for i, it in enumerate(raw_items, start=1):
             if not it.get("itemTy"):
@@ -372,12 +499,12 @@ class HsuClient:
                 " ",
                 BeautifulSoup((info.get("guide") or "").replace("</p>", "</p>\n"), "html.parser").get_text(""),
             ).strip(),
-            hours=tuple(h.strip() for h in setup["resveTm"].split(",") if h.strip()),
-            slot_minutes=int(setup.get("posblTerm") or 60),
-            allowed_weekdays=tuple(d.strip() for d in (setup.get("posblDay") or "").split(",") if d.strip()),
-            lead_hours=int(setup.get("posblTm") or 0),
-            period_start=datetime.strptime(setup["posblBgnde"], "%Y%m%d").date(),
-            period_end=datetime.strptime(setup["posblEndde"], "%Y%m%d").date(),
+            hours=rules.hours,
+            slot_minutes=rules.slot_minutes,
+            allowed_weekdays=rules.allowed_weekdays,
+            lead_hours=rules.lead_hours,
+            period_start=rules.period_start,
+            period_end=rules.period_end,
             items=tuple(items),
             raw_item_count=len(raw_items),
         )
@@ -387,29 +514,37 @@ class HsuClient:
     # ---------------- availability ----------------
 
     def taken_hours(self, place: Place, room: Room, day: date) -> list[str]:
+        """Authoritative per-room check (what the registration form itself uses)."""
         rows = self._post_json(place, "resveList", {"resveSpceSeq": str(room.seq), "resveDeStr": day.isoformat()})
         return sorted({r["resveTm"] for r in rows if r.get("resveTm")})
 
-    def day_availability(self, place: Place, room: Room, day: date, now: datetime | None = None) -> DayAvailability:
-        setup = self.room_setup(place, room)
+    def day_availability(
+        self, place: Place, room: Room, day: date, now: datetime | None = None, authoritative: bool = False
+    ) -> DayAvailability:
+        """authoritative=False reads the shared month calendar (cheap); True asks resveList for this room."""
+        rules = self.room_rules(place, room)
         now = now or datetime.now(KST)
         weekday = WEEKDAYS_KO[day.weekday()]
         closed = None
-        if setup.allowed_weekdays and weekday not in setup.allowed_weekdays:
-            closed = f"{weekday}요일은 예약 불가 (가능 요일: {','.join(setup.allowed_weekdays)})"
-        elif not (setup.period_start <= day <= setup.period_end):
-            closed = f"예약 가능 기간({setup.period_start}~{setup.period_end}) 밖의 날짜"
+        if rules.allowed_weekdays and weekday not in rules.allowed_weekdays:
+            closed = f"{weekday}요일은 예약 불가 (가능 요일: {','.join(rules.allowed_weekdays)})"
+        elif not (rules.period_start <= day <= rules.period_end):
+            closed = f"예약 가능 기간({rules.period_start}부터 {rules.period_end}까지) 밖의 날짜"
         elif day < now.date():
             closed = "지난 날짜"
         if closed:
             return DayAvailability(
-                room=room, day=day, open_hours=(), taken_hours=(), closed_reason=closed, slot_minutes=setup.slot_minutes
+                room=room, day=day, open_hours=(), taken_hours=(), closed_reason=closed, slot_minutes=rules.slot_minutes
             )
 
-        taken = set(self.taken_hours(place, room, day))
-        earliest = now + timedelta(hours=setup.lead_hours)
+        if authoritative:
+            taken = set(self.taken_hours(place, room, day))
+        else:
+            busy = self._calendar(place, day.year, day.month)[1].get((room.name, day), set())
+            taken = {h for h in rules.hours if h in busy}
+        earliest = now + timedelta(hours=rules.lead_hours)
         open_, not_yet = [], []
-        for h in setup.hours:
+        for h in rules.hours:
             if h in taken:
                 continue
             slot_start = datetime.combine(day, datetime.strptime(h, "%H:%M").time(), tzinfo=KST)
@@ -422,26 +557,32 @@ class HsuClient:
             day=day,
             open_hours=tuple(open_),
             taken_hours=tuple(sorted(taken)),
-            slot_minutes=setup.slot_minutes,
+            slot_minutes=rules.slot_minutes,
             not_yet_hours=tuple(not_yet),
         )
 
     # ---------------- my reservations ----------------
 
-    def my_reservations(self, place: Place, pages: int = 2) -> list[MyReservation]:
+    def my_reservations(self, place: Place, pages: int = 1) -> list[MyReservation]:
+        """Newest applications first; one page (10 rows) covers anything recent."""
         self.profile(place)
         out: list[MyReservation] = []
-        for page in range(1, pages + 1):
+        relogged = False
+        page = 1
+        while page <= pages:
             resp = self.http.post(
                 self._url(place, "artclView"), data={"layout": "", "page": str(page), "prgrsCd": "", "resveSpceSeq": ""}
             )
             resp.raise_for_status()
+            _check_rejected(resp)
             soup = BeautifulSoup(resp.text, "html.parser")
             if soup.find("form", attrs={"name": "actionForm"}) is None:
-                if page == 1:
+                if page == 1 and not relogged:  # session expired
                     self._login(place)
-                    return self.my_reservations(place, pages)
+                    relogged = True
+                    continue
                 break
+            page += 1
             rows = [tr for tr in soup.select("form[name=actionForm] table tr") if tr.find("td")]
             parsed = 0
             for tr in rows:
@@ -553,6 +694,7 @@ class HsuClient:
 
 def server_message(resp: httpx.Response) -> str:
     """K2Web reports results via a redirect to /message/message.do?message=..., or an inline 알림메세지 page."""
+    _check_rejected(resp)
     if resp.url.path.endswith("/message/message.do") and resp.url.params.get("message"):
         return resp.url.params["message"]
     soup = BeautifulSoup(resp.text, "html.parser")

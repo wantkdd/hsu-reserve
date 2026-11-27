@@ -12,7 +12,8 @@ from .client import HsuError
 from .service import ReservationService
 
 INSTRUCTIONS = """\
-한성대학교 공간 예약 도구 (상상베이스: 상상관 B2 IB101~IB108·세미나실 IB111 / 코딩라운지: 공학관 A동 세미나실 101~113호).
+한성대학교 공간 예약 도구 (상상베이스: 상상관 B2 IB101-IB108·세미나실 IB111 / 코딩라운지: 공학관 A동 세미나실 101-113호).
+- 답변에서 시간 범위는 "12:00-14:00"처럼 하이픈으로 쓰세요. 물결표(~)는 마크다운에서 취소선으로 렌더링됩니다.
 - 시간은 모두 KST. 날짜는 YYYY-MM-DD 또는 오늘/내일/모레. 현재 시각이 필요하면 list_spaces 의 now 를 보세요.
 - "자리 있어?" → check_availability. 비어있지 않으면 응답의 alternatives 를 그대로 제안하세요.
 - "예약해줘" → reserve. status 가 reserved(검증 완료)일 때만 예약됐다고 말하세요.

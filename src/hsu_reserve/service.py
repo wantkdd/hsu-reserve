@@ -54,7 +54,7 @@ def room_capacity(place: Place, room: Room) -> tuple[int | None, int | None]:
 
 
 def windows(hours: tuple[str, ...] | list[str], slot_minutes: int) -> list[str]:
-    """Merge consecutive slot starts into "HH:MM~HH:MM" ranges."""
+    """Merge consecutive slot starts into "HH:MM-HH:MM" ranges (hyphen: a pair of "~" renders as strikethrough)."""
     out: list[str] = []
     start = prev = None
     step = timedelta(minutes=slot_minutes)
@@ -64,10 +64,10 @@ def windows(hours: tuple[str, ...] | list[str], slot_minutes: int) -> list[str]:
             prev = t
             continue
         if start is not None:
-            out.append(f"{start:%H:%M}~{prev + step:%H:%M}")
+            out.append(f"{start:%H:%M}-{prev + step:%H:%M}")
         start = prev = t
     if start is not None:
-        out.append(f"{start:%H:%M}~{prev + step:%H:%M}")
+        out.append(f"{start:%H:%M}-{prev + step:%H:%M}")
     return out
 
 
@@ -128,7 +128,7 @@ class ReservationService:
                 if opens[i + n - 1] - opens[i] == step * (n - 1):  # n consecutive slots
                     s = opens[i]
                     candidates.append(
-                        (abs((s - want).total_seconds()), f"{PLACES[pk].name} {name} {s:%H:%M}~{s + step * n:%H:%M}")
+                        (abs((s - want).total_seconds()), f"{PLACES[pk].name} {name} {s:%H:%M}-{s + step * n:%H:%M}")
                     )
         candidates.sort()
         result = {"same_time_other_rooms": same_time, "other_times": [c for _, c in candidates[:limit]]}
@@ -164,19 +164,18 @@ class ReservationService:
             for p in PLACES.values():
                 rooms = []
                 for r in self.client.rooms(p):
-                    s = self.client.room_setup(p, r)
+                    s = self.client.room_rules(p, r)
                     mn, mx = room_capacity(p, r)
                     rooms.append(
                         {
                             "room": r.name,
-                            "hours": f"{s.hours[0]}~{s.slot_end(s.hours[-1])}" if s.hours else None,
+                            "hours": f"{s.hours[0]}-{s.slot_end(s.hours[-1])}" if s.hours else None,
                             "slot_minutes": s.slot_minutes,
                             "weekdays": ",".join(s.allowed_weekdays),
-                            "bookable_period": f"{s.period_start}~{s.period_end}",
+                            "bookable_period": f"{s.period_start}/{s.period_end}",
                             "book_at_least_hours_before": s.lead_hours,
                             "min_people": mn,
                             "max_people": mx,
-                            "required_fields": [i.name for i in s.items if i.required],
                         }
                     )
                 guide = self.client.room_setup(p, self.client.rooms(p)[0]).guide if rooms else ""
@@ -233,7 +232,7 @@ class ReservationService:
                     available.append(entry)
             result = {
                 "date": header,
-                "time": f"{hours[0]}~{av_end(hours[-1], slot)}",
+                "time": f"{hours[0]}-{av_end(hours[-1], slot)}",
                 "available": available,
                 "unavailable": unavailable,
             }
@@ -262,7 +261,7 @@ class ReservationService:
             today = datetime.now(KST).date()
             rows = []
             for p in self._places(place):
-                for r in self.client.my_reservations(p, pages=3 if include_past else 2):
+                for r in self.client.my_reservations(p, pages=3 if include_past else 1):
                     if not include_past and (r.day < today or r.status not in ACTIVE_STATUSES):
                         continue
                     rows.append(_res_dict(r))
@@ -288,11 +287,11 @@ class ReservationService:
             setup = self.client.room_setup(p, r)
             hours = hours_between(normalize_time(start), normalize_time(end), setup.slot_minutes)
             label = (
-                f"{p.name} {r.name} {d}({WEEKDAYS_KO[d.weekday()]}) {hours[0]}~{av_end(hours[-1], setup.slot_minutes)}"
+                f"{p.name} {r.name} {d}({WEEKDAYS_KO[d.weekday()]}) {hours[0]}-{av_end(hours[-1], setup.slot_minutes)}"
             )
 
-            # 1) availability
-            av = self.client.day_availability(p, r, d)
+            # 1) availability — authoritative per-room check right before submitting
+            av = self.client.day_availability(p, r, d, authoritative=True)
             reason = self._hour_status(av, hours)
             if reason:
                 avs = self._collect(list(PLACES.values()), d)
@@ -304,9 +303,7 @@ class ReservationService:
                 }
 
             # 2) daily limit (posted rule; violating bookings get cancelled by staff)
-            mine_today = [
-                x for x in self.client.my_reservations(p, pages=2) if x.day == d and x.status in ACTIVE_STATUSES
-            ]
+            mine_today = [x for x in self.client.my_reservations(p) if x.day == d and x.status in ACTIVE_STATUSES]
             already = sum(len(x.hours) for x in mine_today) * setup.slot_minutes / 60
             total = already + len(hours) * setup.slot_minutes / 60
             if total > p.max_hours_per_day:
@@ -364,7 +361,7 @@ class ReservationService:
                 return {"status": "failed", "request": label, "server_message": message}
 
             # 5) verify: my list has an active row for exactly this room/date/hours, and the slots read as taken
-            mine = self.client.my_reservations(p, pages=2)
+            mine = self.client.my_reservations(p)
             match = next(
                 (
                     x
@@ -396,8 +393,11 @@ class ReservationService:
     def cancel(self, place: str, reservation_id: int) -> dict:
         with self._lock:
             p = resolve_place(place)
-            before = {x.id: x for x in self.client.my_reservations(p, pages=3)}
-            target = before.get(reservation_id)
+            pages = 1
+            target = next((x for x in self.client.my_reservations(p) if x.id == reservation_id), None)
+            if target is None:
+                pages = 3
+                target = next((x for x in self.client.my_reservations(p, pages=pages) if x.id == reservation_id), None)
             if target is None:
                 return {
                     "status": "not_found",
@@ -406,7 +406,7 @@ class ReservationService:
             if not target.cancellable:
                 return {"status": "not_cancellable", "reservation": _res_dict(target)}
             ok, message = self.client.cancel(p, reservation_id)
-            after = next((x for x in self.client.my_reservations(p, pages=3) if x.id == reservation_id), None)
+            after = next((x for x in self.client.my_reservations(p, pages=pages) if x.id == reservation_id), None)
             r = self.client.find_room(p, target.room)
             still_taken = sorted(set(target.hours) & set(self.client.taken_hours(p, r, target.day)))
             verified = ok and after is not None and after.status not in ACTIVE_STATUSES
