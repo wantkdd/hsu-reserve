@@ -3,7 +3,7 @@
 #   curl -LsSf https://raw.githubusercontent.com/wantkdd/hsu-reserve/master/install.sh | sh
 set -eu
 
-REPO="git+https://github.com/wantkdd/hsu-reserve"
+REPO="https://github.com/wantkdd/hsu-reserve/archive/refs/heads/master.zip"
 export PATH="$HOME/.local/bin:$PATH"
 
 echo "=== 한성대 공간 예약 (hsu-reserve) 설치 ==="

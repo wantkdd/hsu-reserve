@@ -1,8 +1,9 @@
 [project]
 name = "hsu-reserve"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server: 한성대학교 상상베이스/코딩라운지 공간 예약 조회·예약·검증·취소"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "SangwanYu", email = "ryusangwan12@gmail.com" }
 ]

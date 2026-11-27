@@ -19,6 +19,7 @@ import json
 import os
 import re
 import time
+from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -44,7 +45,7 @@ def _check_rejected(resp: httpx.Response) -> None:
     if "<title>Request Rejected</title>" in resp.text[:300]:
         sid = re.search(r"support ID is: <?(\d+)", resp.text)
         raise HsuError(
-            "학교 사이트 보안장비가 요청을 거절했습니다(짧은 시간에 요청이 많았음). 잠시 후 다시 시도하세요."
+            "학교 사이트 보안장비가 요청을 거절했습니다. 원인은 확인되지 않았습니다. 잠시 후 다시 시도하세요."
             + (f" 지원 ID: {sid[1]}" if sid else "")
         )
 
@@ -219,9 +220,15 @@ def load_credentials() -> tuple[str, str]:
 
 
 def save_credentials(uid: str, pw: str) -> None:
-    delete_credentials()
-    keyring.set_password(KEYRING_SERVICE, _KEYRING_ID_SLOT, uid)
+    old = keyring.get_password(KEYRING_SERVICE, _KEYRING_ID_SLOT)
+    # Keep the old account usable until both new entries have been saved.
     keyring.set_password(KEYRING_SERVICE, uid, pw)
+    keyring.set_password(KEYRING_SERVICE, _KEYRING_ID_SLOT, uid)
+    if old and old != uid:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, old)
+        except keyring.errors.KeyringError:
+            pass  # the new account is already active; cleanup is best effort
 
 
 def delete_credentials() -> None:
@@ -259,12 +266,44 @@ def _text(el) -> str:
     return el.get_text(" ", strip=True) if el is not None else ""
 
 
+def _valid_static_data(endpoint: str, data: object) -> bool:
+    """Treat damaged disk entries like cache misses, never like room rules."""
+    if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+        return False
+    try:
+        if endpoint == "resveSetup":
+            if len(data) != 1:
+                return False
+            row = data[0]
+            hours = [h.strip() for h in row["resveTm"].split(",") if h.strip()]
+            if not hours or any(datetime.strptime(h, "%H:%M").strftime("%H:%M") != h for h in hours):
+                return False
+            if int(row.get("posblTerm") or 60) <= 0 or int(row.get("posblTm") or 0) < 0:
+                return False
+            days = [d.strip() for d in (row.get("posblDay") or "").split(",") if d.strip()]
+            if any(len(d) != 1 or d not in WEEKDAYS_KO for d in days):
+                return False
+            start = datetime.strptime(row["posblBgnde"], "%Y%m%d").date()
+            end = datetime.strptime(row["posblEndde"], "%Y%m%d").date()
+            return start <= end
+        if endpoint == "artclSetupList":
+            if len(data) != 1 or int(data[0]["resveGroupSeq"]) <= 0:
+                return False
+            fields = ("groupNm", "mngr", "telno", "identityCode", "guide")
+        elif endpoint == "itemList":
+            fields = ("itemTy", "itemNm", "mustYn", "itemCn", "option1", "option2", "option3")
+        else:
+            return False
+        return all(row.get(key) is None or isinstance(row[key], str) for row in data for key in fields)
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return False
+
+
 class HsuClient:
     def __init__(self, user_id: str | None = None, password: str | None = None, timeout: float = 20.0):
         self._uid = user_id
         self._pw = password
         self._profiles: dict[str, Profile] = {}
-        self._setup_cache: dict[tuple[str, int], RoomSetup] = {}
         self._calendars: dict[tuple[str, int, int], tuple[float, list[Room], dict[tuple[str, date], set[str]]]] = {}
         self._last_request = 0.0
         self._disk_cache_path = _cache_dir() / "setup-v1.json"
@@ -354,16 +393,23 @@ class HsuClient:
             raise HsuError(f"{endpoint} 응답을 해석하지 못했습니다: {resp.text[:200]!r}") from None
 
     def _static_json(self, place: Place, endpoint: str, room: Room) -> list[dict]:
-        """Public, rarely-changing room setup; cached on disk for SETUP_TTL."""
+        """Public room setup, validated before use and disk-cached for SETUP_TTL."""
         if self._disk_cache is None:
             try:
-                self._disk_cache = json.loads(self._disk_cache_path.read_text(encoding="utf-8"))
+                cache = json.loads(self._disk_cache_path.read_text(encoding="utf-8"))
+                self._disk_cache = cache if isinstance(cache, dict) else {}
             except (OSError, ValueError):
                 self._disk_cache = {}
         key = f"{place.site_id}/{endpoint}/{room.seq}"
         hit = self._disk_cache.get(key)
-        if hit and time.time() - hit["at"] < SETUP_TTL:
-            return hit["data"]
+        if isinstance(hit, dict):
+            at = hit.get("at")
+            if (
+                isinstance(at, (int, float))
+                and 0 <= time.time() - at < SETUP_TTL
+                and _valid_static_data(endpoint, hit.get("data"))
+            ):
+                return hit["data"]
         resp = self.http.post(
             self._url(place, endpoint),
             data={"resveSpceSeq": str(room.seq)},
@@ -375,6 +421,8 @@ class HsuClient:
             data = resp.json()
         except ValueError:
             raise HsuError(f"{endpoint} 응답을 해석하지 못했습니다: {resp.text[:200]!r}") from None
+        if not _valid_static_data(endpoint, data):
+            raise HsuError(f"{endpoint} 공간 설정 응답이 올바르지 않습니다.")
         self._disk_cache[key] = {"at": time.time(), "data": data}
         try:
             self._disk_cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -409,29 +457,53 @@ class HsuClient:
         ym = re.search(r"(\d{4})년\s*(\d{1,2})월", title or "")
         if ym is None or (int(ym[1]), int(ym[2])) != (year, month):
             raise HsuError(f"{year}-{month:02d} 예약 현황 달력을 읽지 못했습니다.")
-        rooms = [
-            Room(seq=int(o["value"]), name=o.get_text(strip=True))
-            for o in soup.select("#resveSpceSeq option")
-            if o.get("value")
-        ]
-        busy: dict[tuple[str, date], set[str]] = {}
-        for td in soup.find_all("td"):
-            span = td.find("span", recursive=False)
-            if span is None or not span.get_text(strip=True).isdigit():
-                continue
-            day = date(year, month, int(span.get_text(strip=True)))
-            for box in td.find_all("div", class_="conBox"):
-                text = box.get_text(" ", strip=True)
-                m = _TIME_RANGE.search(text)
-                if m is None:
+        error = f"{year}-{month:02d} 예약 현황 달력의 공간/시간 정보를 확인하지 못했습니다."
+        try:
+            rooms = [
+                Room(seq=int(o["value"]), name=o.get_text(strip=True))
+                for o in soup.select("#resveSpceSeq option")
+                if o.get("value")
+            ]
+            names = {re.sub(r"\s+", "", room.name): room.name for room in rooms}
+            if not rooms or len(names) != len(rooms) or "" in names:
+                raise ValueError("missing or ambiguous rooms")
+            busy: dict[tuple[str, date], set[str]] = {}
+            days: set[int] = set()
+            parsed_boxes = 0
+            for td in soup.find_all("td"):
+                span = td.find("span", recursive=False)
+                if span is None or not span.get_text(strip=True).isdigit():
                     continue
-                room_name = text[: m.start()].strip().lstrip("-").strip()
-                t = datetime(2000, 1, 1, int(m[1]), int(m[2]))
-                end = datetime(2000, 1, 1, int(m[3]), int(m[4]))
-                slots = busy.setdefault((room_name, day), set())
-                while t < end:
-                    slots.add(t.strftime("%H:%M"))
-                    t += timedelta(minutes=30)  # finer than any slot; matched against slot starts below
+                day = date(year, month, int(span.get_text(strip=True)))
+                if day.day in days:
+                    raise ValueError("duplicate calendar day")
+                days.add(day.day)
+                for box in td.find_all("div", class_="conBox"):
+                    text = box.get_text(" ", strip=True)
+                    matches = list(_TIME_RANGE.finditer(text))
+                    if len(matches) != 1:
+                        raise ValueError("unreadable occupied range")
+                    m = matches[0]
+                    name = text[: m.start()].strip().lstrip("-").strip()
+                    room_name = names.get(re.sub(r"\s+", "", name))
+                    if room_name is None:
+                        raise ValueError("unknown occupied room")
+                    t = datetime(2000, 1, 1, int(m[1]), int(m[2]))
+                    end = datetime(2000, 1, 1, int(m[3]), int(m[4]))
+                    if t >= end:
+                        raise ValueError("invalid occupied range")
+                    slots = busy.setdefault((room_name, day), set())
+                    # Minute precision also blocks partial overlaps with a booking slot.
+                    while t < end:
+                        slots.add(t.strftime("%H:%M"))
+                        t += timedelta(minutes=1)
+                    parsed_boxes += 1
+            if days != set(range(1, monthrange(year, month)[1] + 1)):
+                raise ValueError("incomplete calendar")
+            if parsed_boxes != len(soup.select("div.conBox")):
+                raise ValueError("unmatched occupied boxes")
+        except (KeyError, TypeError, ValueError):
+            raise HsuError(error) from None
         self._calendars[key] = (time.monotonic(), rooms, busy)
         return rooms, busy
 
@@ -467,9 +539,6 @@ class HsuClient:
         )
 
     def room_setup(self, place: Place, room: Room) -> RoomSetup:
-        key = (place.site_id, room.seq)
-        if key in self._setup_cache:
-            return self._setup_cache[key]
         info = self._static_json(place, "artclSetupList", room)[0]
         raw_items = self._static_json(place, "itemList", room)
         rules = self.room_rules(place, room)
@@ -487,7 +556,7 @@ class HsuClient:
                     options=tuple(o for o in (it.get("option1"), it.get("option2"), it.get("option3")) if o),
                 )
             )
-        rs = RoomSetup(
+        return RoomSetup(
             room=room,
             group_seq=int(info["resveGroupSeq"]),
             group_name=info.get("groupNm") or "",
@@ -508,8 +577,6 @@ class HsuClient:
             items=tuple(items),
             raw_item_count=len(raw_items),
         )
-        self._setup_cache[key] = rs
-        return rs
 
     # ---------------- availability ----------------
 
@@ -540,8 +607,18 @@ class HsuClient:
         if authoritative:
             taken = set(self.taken_hours(place, room, day))
         else:
-            busy = self._calendar(place, day.year, day.month)[1].get((room.name, day), set())
-            taken = {h for h in rules.hours if h in busy}
+            rooms, calendar = self._calendar(place, day.year, day.month)
+            if room not in rooms:
+                raise HsuError(f"{place.name} 달력에서 {room.name} 공간을 확인하지 못했습니다.")
+            busy = calendar.get((room.name, day), set())
+            taken = set()
+            for h in rules.hours:
+                slot_start = datetime.strptime(h, "%H:%M")
+                if any(
+                    (slot_start + timedelta(minutes=offset)).strftime("%H:%M") in busy
+                    for offset in range(rules.slot_minutes)
+                ):
+                    taken.add(h)
         earliest = now + timedelta(hours=rules.lead_hours)
         open_, not_yet = [], []
         for h in rules.hours:
@@ -563,13 +640,15 @@ class HsuClient:
 
     # ---------------- my reservations ----------------
 
-    def my_reservations(self, place: Place, pages: int = 1) -> list[MyReservation]:
-        """Newest applications first; one page (10 rows) covers anything recent."""
+    def my_reservations(self, place: Place) -> list[MyReservation]:
+        """Read every page; application order does not bound the reservation date."""
         self.profile(place)
         out: list[MyReservation] = []
+        seen: set[int] = set()
         relogged = False
         page = 1
-        while page <= pages:
+        last_page = 1
+        while page <= last_page:
             resp = self.http.post(
                 self._url(place, "artclView"), data={"layout": "", "page": str(page), "prgrsCd": "", "resveSpceSeq": ""}
             )
@@ -581,14 +660,24 @@ class HsuClient:
                     self._login(place)
                     relogged = True
                     continue
-                break
-            page += 1
+                raise HsuError(f"{place.name} 내 신청내역 {page}페이지를 읽지 못했습니다.")
+            # K2Web's last-page link includes the actual total, even across page groups.
+            for link in soup.select("._paging a[href]"):
+                match = re.search(r"page_link\s*\(\s*['\"]?(\d+)", link["href"])
+                if match:
+                    last_page = max(last_page, int(match[1]))
             rows = [tr for tr in soup.select("form[name=actionForm] table tr") if tr.find("td")]
             parsed = 0
             for tr in rows:
                 tds = tr.find_all("td")
-                if len(tds) < 9 or not _text(tds[0]).isdigit():
+                if not _text(tds[0]).isdigit():
                     continue
+                if len(tds) < 9:
+                    raise HsuError(f"{place.name} 내 신청내역 {page}페이지의 예약 행을 해석하지 못했습니다.")
+                reservation_id = int(_text(tds[0]))
+                if reservation_id in seen:
+                    raise HsuError(f"{place.name} 내 신청내역 페이지가 중복되어 전체 목록을 확인할 수 없습니다.")
+                seen.add(reservation_id)
                 parsed += 1
                 out.append(
                     MyReservation(
@@ -603,9 +692,10 @@ class HsuClient:
                         cancellable=tds[8].find("a", href=re.compile(r"artclCancle")) is not None,
                     )
                 )
-            if parsed == 0:
-                break
-        return out
+            if parsed == 0 and page < last_page:
+                raise HsuError(f"{place.name} 내 신청내역 {page}페이지가 비어 있어 전체 목록을 확인할 수 없습니다.")
+            page += 1
+        return sorted(out, key=lambda row: row.id, reverse=True)
 
     # ---------------- reserve / cancel ----------------
 
@@ -662,6 +752,7 @@ class HsuClient:
         # jQuery serializeArray → object: duplicate keys collapse to the last value (site behavior).
         resp = self.http.post(url, data=dict(form), headers={"X-Requested-With": "XMLHttpRequest"})
         resp.raise_for_status()
+        _check_rejected(resp)
         if resp.text.strip():
             try:
                 payload = resp.json()
@@ -675,19 +766,28 @@ class HsuClient:
             ]
             if errors:
                 return False, " / ".join(errors)
-        resp = self.http.post(
-            url,
-            content=urlencode(form).encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        try:
+            resp = self.http.post(
+                url,
+                content=urlencode(form).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        finally:
+            # Even an ambiguous response may have changed the school state.
+            self._calendars.clear()
         resp.raise_for_status()
+        _check_rejected(resp)
         message = server_message(resp)
         return "완료" in message, message
 
     def cancel(self, place: Place, reservation_id: int) -> tuple[bool, str]:
         self.profile(place)
-        resp = self.http.get(f"/resve/{place.site_id}/{place.fnct_no}/{reservation_id}/artclCancle.do")
+        try:
+            resp = self.http.get(f"/resve/{place.site_id}/{place.fnct_no}/{reservation_id}/artclCancle.do")
+        finally:
+            self._calendars.clear()
         resp.raise_for_status()
+        _check_rejected(resp)
         message = server_message(resp)
         return "취소했습니다" in message, message
 

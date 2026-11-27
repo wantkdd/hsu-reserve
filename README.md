@@ -7,6 +7,12 @@
 > "내 예약 보여줘" / "그거 취소해줘"
 
 ## 설치
+먼저 사용할 AI 앱을 설치하고 로그인해 두세요. 웹 ChatGPT·Gemini가 아닌, 로컬 MCP를 지원하는 PC 앱이 필요합니다.
+
+**파일로 설치**: [ZIP 다운로드](https://github.com/wantkdd/hsu-reserve/archive/refs/heads/master.zip) → 압축 해제 → Mac은 `install-mac.command`, Windows는 `install-windows.bat` 실행.
+
+Mac에서 보안 경고로 열리지 않으면 아래 터미널 명령을 사용하세요.
+
 
 **macOS**: 터미널에 붙여넣고 엔터
 
@@ -25,6 +31,7 @@ irm https://raw.githubusercontent.com/wantkdd/hsu-reserve/master/install.ps1 | i
 3. AI 앱을 완전히 종료했다가 다시 실행하면 끝입니다.
 
 지원 앱: Claude Desktop, Claude Code, Codex, Cursor, Gemini CLI, Windsurf, VS Code
+검증: macOS의 Claude Code·Codex에서 확인했습니다. Windows와 나머지 앱은 실제 사용 검증 전입니다.
 
 비밀번호는 내 컴퓨터의 키체인(Windows는 자격 증명 관리자)에만 저장되고, 한성대 홈페이지 로그인에만 사용됩니다.
 

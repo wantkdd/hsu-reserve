@@ -261,7 +261,7 @@ class ReservationService:
             today = datetime.now(KST).date()
             rows = []
             for p in self._places(place):
-                for r in self.client.my_reservations(p, pages=3 if include_past else 1):
+                for r in self.client.my_reservations(p):
                     if not include_past and (r.day < today or r.status not in ACTIVE_STATUSES):
                         continue
                     rows.append(_res_dict(r))
@@ -393,20 +393,16 @@ class ReservationService:
     def cancel(self, place: str, reservation_id: int) -> dict:
         with self._lock:
             p = resolve_place(place)
-            pages = 1
             target = next((x for x in self.client.my_reservations(p) if x.id == reservation_id), None)
-            if target is None:
-                pages = 3
-                target = next((x for x in self.client.my_reservations(p, pages=pages) if x.id == reservation_id), None)
             if target is None:
                 return {
                     "status": "not_found",
-                    "reason": f"{p.name} 내 신청내역(최근 3페이지)에 #{reservation_id} 가 없습니다.",
+                    "reason": f"{p.name} 내 신청내역에 #{reservation_id} 가 없습니다.",
                 }
             if not target.cancellable:
                 return {"status": "not_cancellable", "reservation": _res_dict(target)}
             ok, message = self.client.cancel(p, reservation_id)
-            after = next((x for x in self.client.my_reservations(p, pages=pages) if x.id == reservation_id), None)
+            after = next((x for x in self.client.my_reservations(p) if x.id == reservation_id), None)
             r = self.client.find_room(p, target.room)
             still_taken = sorted(set(target.hours) & set(self.client.taken_hours(p, r, target.day)))
             verified = ok and after is not None and after.status not in ACTIVE_STATUSES
